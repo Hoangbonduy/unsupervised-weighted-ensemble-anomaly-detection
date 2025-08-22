@@ -1,0 +1,14 @@
+TÓM TẮT TWO-JUDGE ENSEMBLE (VUS-ROC + PREDICTION ERROR)
+============================================================
+Số placeId đã xử lý: 30
+
+--- Two-Judge Ensemble Composite F1-Score ---
+  Trung bình: 0.4969
+--- Two-Judge Ensemble Affiliation F1-Score ---
+  Trung bình: 0.6412
+--- Two-Judge Ensemble Temporal Distance ---
+  Trung bình: 871.3333
+
+Judge 1: VUS-ROC trên synthetic anomaly injection
+Judge 2: Prediction Error correlation với residual
+Aggregation: Harmonic mean của rankings (1/rank)

@@ -286,7 +286,7 @@ def visualize_ensemble_result(series, true_labels, predicted_labels, place_id, o
 
 DATA_FILE_PATH = 'data/cleaned_data_no_zero_periods_filtered.csv'
 LABEL_DIR = 'labels'
-OUTPUT_DIR = 'ensemble_results_final'
+OUTPUT_DIR = 'ensemble_results_final_2'
 
 def main():
     print("Bắt đầu quy trình Weighted Ensemble cho từng PlaceID...")

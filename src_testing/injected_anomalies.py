@@ -70,20 +70,63 @@ class AnomalyInjector:
         return series, labels
 
     def _inject_seasonal(self, series, params):
-        series, labels = series.copy(), np.zeros_like(series, dtype=int)
-        period = params["period"]
-        if len(series) < period * 2: return series, labels
+        """
+        Injects seasonal anomalies by explicitly creating both spikes and dips
+        that violate the seasonal pattern.
+        - Spikes: Injects high values at seasonal troughs.
+        - Dips: Injects low values at seasonal peaks.
+        """
+        series_copy, labels = series.copy(), np.zeros_like(series, dtype=int)
+        
+        period = params.get("period", 7)
+        n_anomalies = params.get("n_anomalies", 4) # Nên là số chẵn để chia đều
+        magnitude_std = params.get("magnitude_std", 2.5)
+
+        if len(series_copy) < period * 2:
+            return series_copy, labels
+
         try:
-            seasonal = seasonal_decompose(series, model='additive', period=period).seasonal
-            peaks, _ = find_peaks(seasonal, height=0)
-            if len(peaks) == 0: return series, labels
-            indices = self.rng.choice(peaks, min(params["n_anomalies"], len(peaks)), replace=False)
-            for idx in indices:
-                series[idx] += self.rng.choice([-1, 1]) * params["magnitude_std"] * np.std(series)
-                labels[idx] = 1
-        except Exception:
+            # 1. Tách thành phần mùa vụ
+            decomposition = seasonal_decompose(series_copy, model='additive', period=period)
+            seasonal = decomposition.seasonal
+
+            # 2. Tìm tất cả các đỉnh và đáy mùa vụ
+            peaks, _ = find_peaks(seasonal)
+            troughs, _ = find_peaks(-seasonal)
+
+            # Nếu không có đủ đỉnh hoặc đáy, không thể chèn bất thường
+            if len(peaks) == 0 or len(troughs) == 0:
+                return series, labels
+
+            # 3. Phân chia số lượng bất thường thành 2 loại: tăng (spikes) và giảm (dips)
+            n_dips = n_anomalies // 2
+            n_spikes = n_anomalies - n_dips
+            
+            magnitude = magnitude_std * np.std(series_copy)
+
+            # 4a. Chèn các điểm "sụt giảm" (Dips) tại các đỉnh mùa vụ
+            if n_dips > 0 and len(peaks) > 0:
+                # Chọn ngẫu nhiên từ các vị trí đỉnh
+                dip_indices = self.rng.choice(peaks, size=min(n_dips, len(peaks)), replace=False)
+                for idx in dip_indices:
+                    # Trừ đi một giá trị lớn để tạo ra một cú sụt giảm
+                    series_copy[idx] -= magnitude * (1 + self.rng.random() * 0.5)
+                    labels[idx] = 1
+
+            # 4b. Chèn các điểm "tăng vọt" (Spikes) tại các đáy mùa vụ
+            if n_spikes > 0 and len(troughs) > 0:
+                # Chọn ngẫu nhiên từ các vị trí đáy
+                spike_indices = self.rng.choice(troughs, size=min(n_spikes, len(troughs)), replace=False)
+                for idx in spike_indices:
+                    # Cộng thêm một giá trị lớn để tạo ra một đỉnh nhọn
+                    series_copy[idx] += magnitude * (1 + self.rng.random() * 0.5)
+                    labels[idx] = 1
+                    
+        except Exception as e:
+            print(f"Error injecting seasonal anomaly: {e}")
             return series, labels
-        return series, labels
+            
+        return series_copy, labels
 
     def _inject_cutoff(self, series, params):
         series, labels = series.copy(), np.zeros_like(series, dtype=int)
@@ -138,13 +181,13 @@ def main():
     injector = AnomalyInjector(random_state=42)
     
     # Danh sách các bất thường đã được tinh gọn
-    injection_types = ["global", "contextual", "trend", "seasonal", "cutoff", "average"]
+    injection_types = ["global", "trend", "seasonal", "cutoff", "average"]
     
     # Cấu hình tương ứng
     profiles = {
         "obvious": {
             "global": {"n_anomalies": 3, "magnitude_std": 7.0},
-            "contextual": {"n_anomalies": 3, "magnitude_std": 5.0},
+            # "contextual": {"n_anomalies": 3, "magnitude_std": 5.0},
             "trend": {"min_len": n//15, "max_len": n//8, "magnitude": np.std(original_series) * 2.0},
             "seasonal": {"n_anomalies": 4, "magnitude_std": 6.0, "period": 7},
             "cutoff": {"min_len": n//20, "max_len": n//10},

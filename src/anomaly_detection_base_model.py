@@ -24,6 +24,7 @@ import numpy as np
 from tqdm import tqdm
 from momentfm import MOMENTPipeline
 import warnings
+from statsmodels.tsa.seasonal import STL
 
 warnings.filterwarnings("ignore")
 
@@ -238,86 +239,6 @@ def statistical_fallback(series):
     if std_val == 0:
         return np.zeros(len(series))
     return np.abs((series - mean_val) / std_val)
-
-def run_iforest_scores(X):
-    """Chạy IsolationForest đã được train với cải thiện."""
-    series = _to_numpy(X)
-    if len(series) < 2:
-        return np.zeros(len(series))
-        
-    try:
-        # Load model và scaler đã train
-        iforest = joblib.load(os.path.join('pretrained_weights', 'iforest_pretrained.joblib'))
-        scaler = joblib.load(os.path.join('pretrained_weights', 'iforest_scaler.joblib'))
-        
-        # Scale dữ liệu
-        X_scaled = scaler.transform(series.reshape(-1, 1))
-        
-        # Tính scores
-        scores = -iforest.decision_function(X_scaled)
-        return np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=0.0)
-        
-    except Exception as e:
-        print(f"Warning: Pre-trained IForest failed, using fallback. Error: {e}")
-        # Fallback method
-        return statistical_fallback(series)
-
-# --- Các hàm trả về PREDICTIONS 0/1 (để chạy sau khi đã chọn model) ---
-
-def run_iforest_predictions(X, contamination_rate=None):
-    """
-    Chạy IForest với model đã được pretrained và threshold thích ứng.
-    """
-    scores = run_iforest_scores(X)
-    
-    if len(scores) == 0 or np.std(scores) <= 1e-8:
-        return np.zeros(len(X)).astype(int)
-    
-    # Adaptive contamination rate dựa trên data length
-    if contamination_rate is None:
-        if len(X) < 100:
-            contamination_rate = 0.08  # 8% cho chuỗi ngắn
-        elif len(X) < 300:
-            contamination_rate = 0.05  # 5% cho chuỗi trung bình
-        else:
-            contamination_rate = 0.03  # 3% cho chuỗi dài
-    
-    # Load thresholds đã được tính toán từ quá trình training
-    try:
-        thresholds = joblib.load(os.path.join('pretrained_weights', 'iforest_thresholds.joblib'))
-        # Sử dụng threshold linh hoạt
-        if contamination_rate >= 0.05:
-            threshold = thresholds['threshold_95']
-        else:
-            threshold = thresholds['threshold_97']
-    except:
-        # Fallback: tính threshold từ scores hiện tại
-        threshold = np.percentile(scores, 100 * (1 - contamination_rate))
-    
-    # Multiple threshold strategies để tránh F1 = 0
-    predictions = (scores > threshold).astype(int)
-    
-    # Strategy 1: Đảm bảo có ít nhất một số anomaly được phát hiện
-    if np.sum(predictions) == 0:
-        # Giảm threshold xuống 90th percentile
-        backup_threshold = np.percentile(scores, 90)
-        predictions = (scores > backup_threshold).astype(int)
-        
-        # Nếu vẫn không có, chọn top 5% điểm cao nhất
-        if np.sum(predictions) == 0:
-            n_anomalies = max(1, int(0.05 * len(scores)))
-            top_indices = np.argsort(scores)[-n_anomalies:]
-            predictions = np.zeros(len(scores), dtype=int)
-            predictions[top_indices] = 1
-    
-    # Strategy 2: Cap maximum anomalies at 20% của data để tránh quá nhiều false positives
-    max_anomalies = max(1, int(0.20 * len(scores)))
-    if np.sum(predictions) > max_anomalies:
-        top_indices = np.argsort(scores)[-max_anomalies:]
-        predictions = np.zeros(len(scores), dtype=int)
-        predictions[top_indices] = 1
-    
-    return predictions
 
 # ==============================================================================
 # PHẦN 4: MOVING AVERAGE VÀ IQR ANOMALY DETECTION
@@ -1092,3 +1013,101 @@ def run_moment_scores(X, window_size: int = 512):
         print(f"[WARNING] MOMENT model gặp lỗi: {e}")
         print("Bỏ qua MOMENT model do lỗi trong quá trình chạy.")
         return np.zeros(original_length)
+    
+# IForest
+def run_iforest_scores(X):
+    series = _to_numpy(X)
+    if len(series) < 2: return np.zeros(len(series))
+    try:
+        iforest = IForest()
+        iforest.fit(series.reshape(-1, 1))
+        scores = iforest.decision_scores_
+        return np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=0.0)
+    except Exception:
+        return statistical_fallback(series)
+
+# SH-ESD+
+def run_shesd_scores(X, seasonality=7, alpha=0.05):
+    """
+    Tính toán điểm bất thường dựa trên thuật toán SH-ESD với cơ chế dừng tự động.
+    Thuật toán sẽ tự dừng khi không còn tìm thấy điểm bất thường nào có ý nghĩa thống kê.
+
+    Args:
+        X (pd.DataFrame or pd.Series): Chuỗi thời gian đầu vào.
+        seasonality (int): Độ dài của một chu kỳ (ví dụ: 7 cho dữ liệu hàng ngày).
+        alpha (float): Mức ý nghĩa thống kê để xác định ngưỡng. Giá trị càng nhỏ,
+                       điều kiện để một điểm bị coi là bất thường càng khắt khe.
+
+    Returns:
+        np.ndarray: Một mảng chứa điểm bất thường. Các điểm không được xác định là
+                    bất thường sẽ có điểm số là 0.
+    """
+    series = _to_numpy(X)
+    n = len(series)
+
+    if n < 2 * seasonality:
+        print(f"Warning (SH-ESD): Dữ liệu quá ngắn ({n}) cho seasonality ({seasonality}).")
+        return statistical_fallback(series)
+
+    try:
+        # Bước 1: Phân rã chuỗi thời gian bằng STL
+        stl = STL(series, period=seasonality, robust=True)
+        result = stl.fit()
+        residual = result.resid
+
+        # --- Bước 2: Áp dụng ESD lặp lại với ngưỡng động ---
+        anomaly_scores = np.zeros(n)
+        
+        # Tạo một bản sao của phần dư để có thể "loại bỏ" các điểm bất thường đã tìm thấy
+        # Sử dụng mask để theo dõi các điểm chưa bị loại bỏ
+        remaining_indices = np.arange(n)
+        
+        # Giới hạn số lần lặp để tránh vòng lặp vô tận, ví dụ 15% dữ liệu
+        max_anoms_to_find = int(np.ceil(n * 0.15))
+
+        for i in range(max_anoms_to_find):
+            if len(remaining_indices) < 3: # Cần ít nhất 3 điểm để tính toán
+                break
+
+            current_residuals = residual[remaining_indices]
+            
+            # Tính median và MAD trên các điểm còn lại
+            res_median = np.median(current_residuals)
+            mad = np.median(np.abs(current_residuals - res_median))
+            
+            if mad == 0:
+                break # Không có độ lệch, không có bất thường
+
+            # Tính điểm thống kê (test statistic) cho các điểm còn lại
+            test_statistics = np.abs((current_residuals - res_median) / mad)
+            
+            # Tìm điểm đáng ngờ nhất
+            max_stat_idx_local = np.argmax(test_statistics)
+            max_score = test_statistics[max_stat_idx_local]
+            
+            # --- Tính ngưỡng thống kê động ---
+            current_n = len(current_residuals)
+            # Dùng phân phối t-student để tìm giá trị tới hạn (critical value)
+            p = 1.0 - (alpha / (2.0 * current_n))
+            critical_value = t.ppf(p, current_n - 2)
+            
+            # --- So sánh và Quyết định ---
+            if max_score > critical_value:
+                # Điểm này là bất thường
+                # Lấy chỉ số gốc của điểm bất thường
+                original_idx = remaining_indices[max_stat_idx_local]
+                
+                # Gán điểm số bất thường
+                anomaly_scores[original_idx] = max_score
+                
+                # "Loại bỏ" điểm này khỏi lần xét tiếp theo
+                remaining_indices = np.delete(remaining_indices, max_stat_idx_local)
+            else:
+                # Nếu điểm cao nhất cũng không vượt ngưỡng, dừng tìm kiếm
+                break
+        
+        return np.nan_to_num(anomaly_scores)
+
+    except Exception as e:
+        print(f"Lỗi trong quá trình chạy SH-ESD auto: {e}. Sử dụng fallback.")
+        return statistical_fallback(series)

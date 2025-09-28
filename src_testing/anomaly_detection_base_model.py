@@ -16,14 +16,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
 from momentfm import MOMENTPipeline
-import warnings
-import pandas as pd
-import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from tqdm import tqdm
-from momentfm import MOMENTPipeline
-import warnings
+from dtaidistance import dtw
 
 warnings.filterwarnings("ignore")
 
@@ -1092,3 +1085,166 @@ def run_moment_scores(X, window_size: int = 512):
         print(f"[WARNING] MOMENT model gặp lỗi: {e}")
         print("Bỏ qua MOMENT model do lỗi trong quá trình chạy.")
         return np.zeros(original_length)
+
+# ILOF
+def _epd(series, j, p):
+    """
+    Implements the Extreme-Pointed Discriminating (EPD) function from Pseudocode 1.
+    Checks if a point is a local maximum, minimum, or neither within a window of size p.
+    
+    Returns:
+        1: if series[j] is a local maximum.
+       -1: if series[j] is a local minimum.
+        0: otherwise.
+    """
+    n = len(series)
+    # Define the local window, ensuring it's within array bounds
+    start = max(0, j - p)
+    end = min(n, j + p + 1)
+    window = series[start:end]
+    
+    # The point at index j corresponds to index (j - start) in the window
+    local_j_idx = j - start
+    
+    is_max = True
+    is_min = True
+    
+    # Check against all other points in the window
+    for i in range(len(window)):
+        if i == local_j_idx:
+            continue
+        if window[i] > series[j]:
+            is_max = False
+        if window[i] < series[j]:
+            is_min = False
+        # Optimization: if it's neither, we can stop early
+        if not is_max and not is_min:
+            break
+            
+    if is_max:
+        return 1
+    elif is_min:
+        return -1
+    else:
+        return 0
+
+def run_ilof_scores(X, max_p=4, k=5):
+    """
+    Calculates anomaly scores based on the ILOF (Improved Local Outlier Factor) algorithm
+    from the paper "Locality-Based Visual Outlier Detection Algorithm for Time Series".
+
+    The algorithm first uses Hierarchy-Segmentation-based Data Extraction (HSDE) to
+    identify the most significant extreme points and then calculates a modified Local
+    Outlier Factor (LOF) score for these points using Dynamic Time Warping (DTW) as the
+    distance metric.
+
+    Args:
+        X (pd.DataFrame or pd.Series): The input time series data.
+        max_p (int): The maximum hierarchy value to consider in the HSDE step. This defines
+                     the largest window for finding extreme points. Corresponds to Max_p
+                     in the paper. Defaults to 4, as used in the ECG experiment.
+        k (int): The number of nearest neighbors to consider for the LOF calculation.
+                 Corresponds to k in k-distance. Defaults to 5.
+
+    Returns:
+        np.ndarray: An array of anomaly scores of the same length as the input series.
+                    Scores are between 0 and 1. A score closer to 1 indicates a higher
+                    likelihood of being an outlier. Points not selected by HSDE have a score of 0.
+    """
+    series = _to_numpy(X)
+    n = len(series)
+
+    # The algorithm requires enough points to form windows and neighborhoods.
+    if n < 2 * max_p + 1 or n <= k:
+        print(f"Warning (ILOF): Series is too short ({n} points) for the given parameters "
+              f"(max_p={max_p}, k={k}). Returning zero scores.")
+        return np.zeros(n)
+
+    try:
+        # --- Part 1: HSDE (Hierarchy-Segmentation-based Data Extraction) ---
+        # This corresponds to Section 3 of the paper.
+
+        # (1.1) HM (Hierarchy Marking of Time Series), based on Pseudocode 2
+        hm = np.zeros(n, dtype=int)
+        for p in range(1, max_p + 1):
+            # Iterate through interior points as per the EPD definition
+            for j in range(1, n - 1):
+                # Check for local maximum
+                if hm[j] == p - 1:
+                    if _epd(series, j, p) == 1:
+                        hm[j] += 1
+                # Check for local minimum (using -(p-1) for negative hierarchy)
+                elif hm[j] == -(p - 1):
+                     if _epd(series, j, p) == -1:
+                        hm[j] -= 1
+        
+        # Mark endpoints with the highest hierarchy to ensure they act as boundaries
+        hm[0] = max_p + 1
+        hm[-1] = max_p + 1
+
+        # (1.2) HSSA (Hierarchy Segmentation Series Accessing), based on Pseudocode 3
+        # Select points where the absolute hierarchy value is at its maximum.
+        # These are the most significant extreme points.
+        hss_indices = np.where(np.abs(hm) >= max_p)[0]
+        
+        if len(hss_indices) <= k:
+            print(f"Warning (ILOF): HSDE selected {len(hss_indices)} points, which is not more than k={k}. "
+                  "Cannot compute LOF. Returning zero scores.")
+            return np.zeros(n)
+            
+        hss_values = series[hss_indices]
+
+        # --- Part 2: Modified LOF Calculation on HSS ---
+        # This corresponds to Section 4 of the paper.
+
+        # (2.1) Calculate the pairwise distance matrix using DTW.
+        # The paper specifies DTW as the dissimilarity measurement.
+        # We create subsequences of length 1 for the distance calculation.
+        hss_subsequences = [[v] for v in hss_values]
+        dtw_matrix = dtw.distance_matrix_fast(hss_subsequences, use_c=True)
+
+        # (2.2) Compute k-distance for each object in HSS
+        k_distances = np.zeros(len(hss_indices))
+        for i in range(len(hss_indices)):
+            distances = np.sort(dtw_matrix[i])
+            # The k-th nearest neighbor is at index k because index 0 is the point itself (distance 0)
+            k_distances[i] = distances[k]
+
+        # (2.3) Compute Local Reachability Density and LOF for each object in HSS
+        lof_scores = np.zeros(len(hss_indices))
+        for i in range(len(hss_indices)):
+            # Find the k-distance neighborhood (N_k)
+            # These are all points whose distance is <= k-distance of point i
+            neighbor_indices = np.where(dtw_matrix[i] <= k_distances[i])[0]
+
+            # Calculate sum of reachability distances to neighbors
+            sum_reach_dist = 0
+            for o_idx in neighbor_indices:
+                # reach-dist(i, o) = max{k-distance(o), DTW(i, o)}
+                reach_dist = max(k_distances[o_idx], dtw_matrix[i][o_idx])
+                sum_reach_dist += reach_dist
+
+            # Calculate Local Reachability Density (rho_k) as per Formula (3)
+            num_neighbors = len(neighbor_indices)
+            if sum_reach_dist > 0:
+                rho_k = num_neighbors / sum_reach_dist
+            else:
+                rho_k = 0 # Avoid division by zero
+            
+            # Calculate Local Outlier Factor (LOF) as per Formula (4)
+            # LOF(x) = 1 - rho_k(x)
+            lof_scores[i] = 1 - rho_k
+
+        # --- Part 3: Map Scores Back to Original Series Length ---
+        final_scores = np.zeros(n)
+        # Assign the calculated LOF scores to the corresponding original indices
+        final_scores[hss_indices] = lof_scores
+        
+        # Normalize to handle potential floating point inaccuracies
+        final_scores = np.clip(final_scores, 0, 1)
+
+        return np.nan_to_num(final_scores, nan=0.0)
+
+    except Exception as e:
+        print(f"Error during ILOF execution: {e}. Returning zero scores.")
+        return np.zeros(n)
